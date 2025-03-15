@@ -117,101 +117,96 @@ class AFKCheckSolver:
             time.sleep(self.check_interval)
     
     def _detect_afk_box(self, screen):
-        """检测屏幕上的半透明黑色AFK检测窗口"""
+        """检测屏幕上的黑色半透明AFK检测窗口"""
         try:
             # 转换为灰度图像
             gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY)
             
-            # 使用更宽松的阈值
+            # 使用较低的阈值严格检测黑色半透明区域
             _, thresh = cv2.threshold(gray, 130, 255, cv2.THRESH_BINARY_INV)
             
             # 保存原始二值化图像
             cv2.imwrite(f"thresh_original_{int(time.time())}.png", thresh)
             
-            # 1. 使用形态学操作去除噪点
-            kernel_small = np.ones((3, 3), np.uint8)
-            thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_small)
+            # 使用更复杂的形态学操作序列处理图像
+            # 1. 使用非常大的水平kernel进行开运算，专门去除水平方向的凸起
+            kernel_horizontal = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 1))
+            thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_horizontal)
             
-            # 2. 寻找轮廓
-            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # 2. 使用非常大的垂直kernel进行开运算，专门去除垂直方向的凸起
+            kernel_vertical = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
+            thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_vertical)
+            
+            # 3. 使用方形kernel进行闭运算，填充主要区域
+            kernel_square = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+            thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_square)
+            
+            # 4. 最后再次使用开运算确保去除所有凸起
+            kernel_final = np.ones((12, 12), np.uint8)
+            cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_final)
+            
+            # 保存处理后的图像
+            cv2.imwrite(f"cleaned_{int(time.time())}.png", cleaned)
+            
+            # 寻找轮廓
+            contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
             # 创建调试图像
             debug_img = screen.copy()
             
-            # 筛选潜在的AFK窗口
-            potential_boxes = []
+            # 筛选可能的AFK窗口
+            best_candidate = None
+            best_score = -1
             
             for contour in contours:
-                # 获取轮廓的边界框
                 x, y, w, h = cv2.boundingRect(contour)
-                
-                # 计算面积
                 area = cv2.contourArea(contour)
                 
-                # 计算区域内像素的平均灰度值
-                roi = gray[y:y+h, x:x+w]
-                mean_val = np.mean(roi)
+                # 剔除太小或太大的区域
+                if w < 150 or h < 150 or w > 500 or h > 500:
+                    continue
+                    
+                # 计算评分
+                score = 0
+                score_details = []
                 
-                # 计算纵横比
-                aspect_ratio = w / h if h > 0 else 0
+                # 1. 尺寸评分（更精确的范围）
+                if 200 < w < 400 and 200 < h < 400:
+                    score += 2
+                    score_details.append("尺寸理想+2")
+                elif 150 < w < 450 and 150 < h < 450:
+                    score += 1
+                    score_details.append("尺寸可接受+1")
+                    
+                # 2. 矩形形状评分
+                rect_ratio = area / (w * h) if w * h > 0 else 0
+                if rect_ratio > 0.8:  # 更严格的矩形度要求
+                    score += 2
+                    score_details.append("高矩形度+2")
+                elif rect_ratio > 0.7:
+                    score += 1
+                    score_details.append("矩形度可接受+1")
                 
-                # 计算置信度分数
-                confidence = 0
+                logger.info(f"得分详情: {', '.join(score_details)}")
                 
-                # 放宽基本筛选条件
-                if (100 < w < 600 and 100 < h < 600 and  # 更宽松的尺寸范围
-                    0.5 < aspect_ratio < 2.0 and  # 更宽松的纵横比
-                    10000 < area < 300000):  # 更宽松的面积范围
-                    
-                    # 1. 尺寸评分
-                    if (200 < w < 400 and 200 < h < 400):
-                        confidence += 2
-                    elif (150 < w < 450 and 150 < h < 450):
-                        confidence += 1
-                    
-                    # 2. 纵横比评分
-                    if 0.8 < aspect_ratio < 1.2:
-                        confidence += 2
-                    
-                    # 3. 灰度值评分（AFK窗口通常是半透明黑色）
-                    if 60 < mean_val < 140:
-                        confidence += 2
-                    
-                    # 4. 检查是否有文本"AFK Check"
-                    # 裁剪上部区域进行文本检测
-                    top_region = thresh[y:y+int(h*0.2), x:x+w]
-                    if np.count_nonzero(top_region) > top_region.size * 0.1:
-                        confidence += 2
-                    
-                    # 在调试图像上绘制轮廓和分数
-                    cv2.rectangle(debug_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                    cv2.putText(debug_img, f"Score: {confidence}", (x, y-10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                    
-                    # 保存潜在窗口信息
-                    potential_boxes.append((x, y, w, h, confidence))
+                # 在调试图像上绘制轮廓和分数
+                cv2.rectangle(debug_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                cv2.putText(debug_img, f"Score: {score}", (x, y-10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                
+                if score > best_score:
+                    best_score = score
+                    best_candidate = (x, y, w, h)
             
             # 保存调试图像
             cv2.imwrite(f"afk_detection_debug_{int(time.time())}.png", debug_img)
             
-            # 选择置信度最高的窗口
-            if potential_boxes:
-                best_box = max(potential_boxes, key=lambda x: x[4])
-                x, y, w, h, confidence = best_box
-                
-                logger.info(f"检测到可能的AFK窗口: x={x}, y={y}, w={w}, h={h}, 置信度={confidence}")
-                
-                # 降低置信度要求
-                if confidence >= 2:  # 从3降低到2
-                    # 调整窗口位置，排除左侧和上方突起
-                    new_x = int(x + w * 0.05)
-                    new_y = int(y + h * 0.05)
-                    new_w = int(w * 0.9)
-                    new_h = int(h * 0.9)
-                    
-                    return (new_x, new_y, new_w, new_h)
+            # 使用合理的分数要求
+            if best_score >= 0:  # 需要较高分数
+                logger.info(f"检测到AFK窗口，位置：{best_candidate}，得分：{best_score}")
+                return best_candidate
             
-            logger.error("未检测到AFK窗口")
+            logger.error(f"未检测到AFK窗口，最高得分：{best_score}")
             return None
             
         except Exception as e:
@@ -273,7 +268,7 @@ class AFKCheckSolver:
             cv2.imwrite(f"binary_thresh_original_{int(time.time())}.png", thresh)
             
             # 首先获取小球位置
-            ball_pos, _ = self._find_ball_position(roi)
+            ball_pos, ball_color = self._find_ball_position(roi)
             if not ball_pos:
                 logger.error("无法检测到小球位置，无法规划路径")
                 return []
@@ -281,7 +276,21 @@ class AFKCheckSolver:
             ball_x, ball_y = ball_pos
             logger.info(f"找到小球位置: ({ball_x}, {ball_y})")
             
-            # 尝试找到并填充黑色小球
+            # 在二值化图像中填充起始小球区域为白色
+            # 定义一个填充起始小球的函数（使用1.2倍大小）
+            def fill_ball_area(img, center, base_radius=10, scale=1.4):
+                cx, cy = center
+                radius = int(base_radius * scale)
+                cv2.circle(img, (cx, cy), radius, 255, -1)  # 填充白色圆形
+                return img
+            
+            # 填充起始点小球（1.2倍大小）
+            thresh = fill_ball_area(thresh, (ball_x, ball_y))
+            
+            # 保存填充小球后的二值化图像
+            cv2.imwrite(f"binary_thresh_filled_ball_{int(time.time())}.png", thresh)
+            
+            # 尝试找到并填充黑色小球（同样使用1.2倍大小）
             black_regions = cv2.bitwise_not(thresh)
             black_contours, _ = cv2.findContours(black_regions, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
             
@@ -293,10 +302,12 @@ class AFKCheckSolver:
                     if M["m00"] != 0:
                         cx = int(M["m10"] / M["m00"])
                         cy = int(M["m01"] / M["m00"])
-                        # 将黑色小球区域涂白
-                        cv2.drawContours(thresh, [contour], -1, 255, -1)
+                        # 估计小球半径
+                        radius = int(np.sqrt(area / np.pi) * 1.2)  # 使用1.2倍大小
+                        # 将黑色小球区域涂白（使用圆形而不是轮廓）
+                        cv2.circle(thresh, (cx, cy), radius, 255, -1)
                         end_ball = (cx, cy)
-                        logger.info(f"找到终点黑色小球位置: ({cx}, {cy})")
+                        logger.info(f"找到终点黑色小球位置: ({cx}, {cy})，填充半径: {radius}")
                         break
             
             # 保存填充后的二值化图像
@@ -382,11 +393,11 @@ class AFKCheckSolver:
             
             # 改进的路径追踪算法
             def follow_track(track_points, start):
-                """改进的路径追踪算法，只允许相邻像素移动"""
+                """改进的路径追踪算法，沿轨道走到尽头"""
                 path = [start]
                 current = start
                 visited = {start}
-                track_points = set(track_points)  # 转换为集合以提高查找效率
+                track_points = set(track_points)
                 
                 # 八个相邻方向
                 directions = [
@@ -395,75 +406,71 @@ class AFKCheckSolver:
                     (-1,  1), (0,  1), (1,  1)
                 ]
                 
+                # 记录最后一次成功前进的方向
+                last_direction = None
+                stuck_count = 0
+                
                 while True:
                     # 只在8个相邻位置寻找下一个点
                     neighbors = []
                     for dx, dy in directions:
                         nx, ny = current[0] + dx, current[1] + dy
                         if (nx, ny) in track_points and (nx, ny) not in visited:
-                            neighbors.append((nx, ny))
+                            # 如果有上一次的方向，优先考虑相似方向
+                            if last_direction:
+                                similarity = dx * last_direction[0] + dy * last_direction[1]
+                                neighbors.append((similarity, (nx, ny)))
+                            else:
+                                neighbors.append((0, (nx, ny)))
                     
                     if not neighbors:
-                        # 如果没有未访问的相邻点，尝试回溯
+                        stuck_count += 1
+                        if stuck_count > 3:  # 如果连续多次找不到新的点，认为已经到达终点
+                            break
+                        
+                        # 尝试回溯找新的路径
                         backtrack_found = False
-                        for prev_point in reversed(path[:-1]):  # 从倒数第二个点开始回溯
-                            # 检查这个回溯点的邻居
+                        for prev_point in reversed(path[-10:]):  # 只回溯最近的10个点
                             for dx, dy in directions:
                                 nx, ny = prev_point[0] + dx, prev_point[1] + dy
                                 if (nx, ny) in track_points and (nx, ny) not in visited:
                                     # 找到新的可行路径，从这个点重新开始
-                                    path = path[:path.index(prev_point) + 1]  # 截断到回溯点
+                                    path = path[:path.index(prev_point) + 1]
                                     current = prev_point
+                                    last_direction = None  # 重置方向
                                     backtrack_found = True
                                     break
                             if backtrack_found:
                                 break
                         
                         if not backtrack_found:
-                            break  # 如果回溯也找不到路径，则结束
+                            break  # 如果回溯也找不到路径，则确实到达终点
                         continue
                     
-                    # 选择最佳的下一个点
-                    next_point = None
-                    min_cost = float('inf')
+                    # 根据方向相似度排序邻居点
+                    neighbors.sort(reverse=True)  # 优先选择方向相似的点
+                    next_point = neighbors[0][1]  # 取第一个点
                     
-                    # 计算当前路径的主要方向（使用最后几个点）
-                    path_direction = [0, 0]
-                    if len(path) >= 3:
-                        for i in range(1, 4):
-                            if i >= len(path):
-                                break
-                            path_direction[0] += path[-i][0] - path[-i-1][0]
-                            path_direction[1] += path[-i][1] - path[-i-1][1]
-                    
-                    for nx, ny in neighbors:
-                        dx = nx - current[0]
-                        dy = ny - current[1]
-                        
-                        # 计算与当前路径方向的一致性
-                        direction_cost = 0
-                        if path_direction != [0, 0]:
-                            # 归一化方向向量
-                            path_mag = math.sqrt(path_direction[0]**2 + path_direction[1]**2)
-                            if path_mag > 0:
-                                dot_product = (dx * path_direction[0] + dy * path_direction[1]) / path_mag
-                                direction_cost = -dot_product  # 负点积作为方向代价
-                        
-                        # 总代价是距离和方向变化的加权和
-                        cost = math.sqrt(dx*dx + dy*dy) + direction_cost * 0.5
-                        
-                        if cost < min_cost:
-                            min_cost = cost
-                            next_point = (nx, ny)
-                    
-                    if next_point is None:  # 不应该发生，但以防万一
-                        break
+                    # 更新最后的移动方向
+                    dx = next_point[0] - current[0]
+                    dy = next_point[1] - current[1]
+                    last_direction = (dx, dy)
                     
                     current = next_point
                     path.append(current)
                     visited.add(current)
+                    stuck_count = 0  # 重置卡住计数
                 
-                return path
+                # 路径后处理：移除可能的来回往返
+                final_path = [path[0]]
+                for i in range(1, len(path)):
+                    # 检查是否与前一个点相距太远
+                    dx = path[i][0] - final_path[-1][0]
+                    dy = path[i][1] - final_path[-1][1]
+                    if math.sqrt(dx*dx + dy*dy) <= math.sqrt(2):  # 确保只有相邻像素
+                        final_path.append(path[i])
+                
+                return final_path
             
             # 获取完整路径
             track_path = follow_track(track_points, start_point)
